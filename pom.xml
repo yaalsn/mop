@@ -184,6 +184,8 @@
                         -Dpulsar.allocator.leak_detection=Advanced
                         -Dlog4j.configurationFile="log4j2.xml"
                     </argLine>
+                    <parallel>all</parallel>
+                    <useUnlimitedThreads>true</useUnlimitedThreads>
                     <reuseForks>false</reuseForks>
                     <forkCount>1</forkCount>
                     <redirectTestOutputToFile>${redirectTestOutputToFile}</redirectTestOutputToFile>
