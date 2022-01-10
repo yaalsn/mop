@@ -38,7 +38,6 @@ import io.streamnative.pulsar.handlers.mqtt.OutstandingPacket;
 import io.streamnative.pulsar.handlers.mqtt.OutstandingPacketContainer;
 import io.streamnative.pulsar.handlers.mqtt.PacketIdGenerator;
 import io.streamnative.pulsar.handlers.mqtt.QosPublishHandlers;
-import io.streamnative.pulsar.handlers.mqtt.exception.MQTTNoSubscriptionExistedException;
 import io.streamnative.pulsar.handlers.mqtt.exception.MQTTServerException;
 import io.streamnative.pulsar.handlers.mqtt.exception.MQTTTopicNotExistedException;
 import io.streamnative.pulsar.handlers.mqtt.exception.handler.MopExceptionHelper;
@@ -60,21 +59,17 @@ import io.streamnative.pulsar.handlers.mqtt.utils.WillMessage;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.bookkeeper.mledger.impl.PositionImpl;
-import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.authentication.AuthenticationDataCommand;
 import org.apache.pulsar.broker.authorization.AuthorizationService;
-import org.apache.pulsar.broker.service.Consumer;
 import org.apache.pulsar.broker.service.Subscription;
-import org.apache.pulsar.broker.service.Topic;
 import org.apache.pulsar.common.api.proto.CommandAck;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.util.FutureUtil;
@@ -93,10 +88,10 @@ public class DefaultProtocolMethodProcessorImpl extends AbstractCommonProtocolMe
     private final AuthorizationService authorizationService;
     private final MQTTMetricsCollector metricsCollector;
     private final MQTTConnectionManager connectionManager;
-    private final MQTTSubscriptionManager subscriptionManager;
+    private final MQTTSubscriptionManager mqttSubscriptionManager;
     private Connection connection;
 
-    public DefaultProtocolMethodProcessorImpl (MQTTService mqttService, ChannelHandlerContext ctx) {
+    public DefaultProtocolMethodProcessorImpl(MQTTService mqttService, ChannelHandlerContext ctx) {
         super(mqttService.getAuthenticationService(),
                 mqttService.getServerConfiguration().isMqttAuthenticationEnabled(), ctx);
         this.pulsarService = mqttService.getPulsarService();
@@ -107,7 +102,7 @@ public class DefaultProtocolMethodProcessorImpl extends AbstractCommonProtocolMe
         this.authorizationService = mqttService.getAuthorizationService();
         this.metricsCollector = mqttService.getMetricsCollector();
         this.connectionManager = mqttService.getConnectionManager();
-        this.subscriptionManager = mqttService.getSubscriptionManager();
+        this.mqttSubscriptionManager = mqttService.getSubscriptionManager();
         this.serverCnx = new MQTTServerCnx(pulsarService, ctx);
     }
 
@@ -153,55 +148,65 @@ public class DefaultProtocolMethodProcessorImpl extends AbstractCommonProtocolMe
         if (log.isDebugEnabled()) {
             log.debug("[Publish] [{}] msg: {}", connection.getClientId(), msg);
         }
-        final int packetId = msg.variableHeader().packetId();
-        // Authorization the client
+        CompletableFuture<Void> result;
         if (!configuration.isMqttAuthorizationEnabled()) {
-            log.info("[Publish] authorization is disabled, allowing client. CId={}, userRole={}",
-                    connection.getClientId(), connection.getUserRole());
-            doPublish(msg);
+            if (log.isDebugEnabled()) {
+                log.debug("[Publish] authorization is disabled, allowing client. CId={}, userRole={}",
+                        connection.getClientId(), connection.getUserRole());
+            }
+            result = doPublish(msg);
         } else {
-            this.authorizationService.canProduceAsync(TopicName.get(msg.variableHeader().topicName()),
+            result = this.authorizationService.canProduceAsync(TopicName.get(msg.variableHeader().topicName()),
                             connection.getUserRole(), new AuthenticationDataCommand(connection.getUserRole()))
-                    .thenAccept((authorized) -> {
-                        if (!authorized) {
-                            log.error("[Publish] not authorized to topic={}, userRole={}, CId= {}",
-                                    msg.variableHeader().topicName(), connection.getUserRole(),
-                                    connection.getClientId());
-                            // Support Mqtt 5
-                            if (MqttUtils.isMqtt5(connection.getProtocolVersion())) {
-                                MqttMessage mqttPubAckMessage =
-                                    MqttPubAckMessageHelper.createMqtt5(packetId, Mqtt5PubReasonCode.NOT_AUTHORIZED,
-                                        String.format("The client %s not authorized.", connection.getClientId()));
-                                channel.writeAndFlush(mqttPubAckMessage);
-                            }
-                            channel.close();
-                        } else {
-                            doPublish(msg);
-                        }
-                    });
+                    .thenCompose(authorized -> authorized ? doPublish(msg) : doUnauthorized(msg));
         }
+        result.thenAccept(__ -> msg.release())
+              .exceptionally(ex -> {
+                    log.error("[{}] Write {} to Pulsar topic failed.", msg.variableHeader().topicName(), msg, ex);
+                    msg.release();
+                    return null;
+                });
     }
 
-    private void doPublish(MqttPublishMessage msg) {
+    private CompletableFuture<Void> doUnauthorized(MqttPublishMessage msg) {
+        log.error("[Publish] not authorized to topic={}, userRole={}, CId= {}",
+                msg.variableHeader().topicName(), connection.getUserRole(),
+                connection.getClientId());
+        // Support Mqtt 5
+        if (MqttUtils.isMqtt5(connection.getProtocolVersion())) {
+            MqttMessage mqttPubAckMessage =
+                    MqttPubAckMessageHelper.createMqtt5(msg.variableHeader().packetId(),
+                            Mqtt5PubReasonCode.NOT_AUTHORIZED,
+                            String.format("The client %s not authorized.", connection.getClientId()));
+            channel.writeAndFlush(mqttPubAckMessage);
+        }
+        channel.close();
+        return CompletableFuture.completedFuture(null);
+    }
+
+    private CompletableFuture<Void> doPublish(MqttPublishMessage msg) {
         final MqttQoS qos = msg.fixedHeader().qosLevel();
         metricsCollector.addSend(msg.payload().readableBytes());
+        CompletableFuture<Void> result;
         switch (qos) {
             case AT_MOST_ONCE:
-                this.qosPublishHandlers.qos0().publish(msg);
+                result = this.qosPublishHandlers.qos0().publish(msg);
                 break;
             case AT_LEAST_ONCE:
                 checkServerReceivePubMessageAndIncrementCounterIfNeeded(msg);
-                this.qosPublishHandlers.qos1().publish(msg);
+                result = this.qosPublishHandlers.qos1().publish(msg);
                 break;
             case EXACTLY_ONCE:
                 checkServerReceivePubMessageAndIncrementCounterIfNeeded(msg);
-                this.qosPublishHandlers.qos2().publish(msg);
+                result = this.qosPublishHandlers.qos2().publish(msg);
                 break;
             default:
                 log.error("Unknown QoS-Type:{}", qos);
                 channel.close();
+                result = CompletableFuture.completedFuture(null);
                 break;
         }
+        return result;
     }
 
     private void checkServerReceivePubMessageAndIncrementCounterIfNeeded(MqttPublishMessage msg) {
@@ -212,9 +217,9 @@ public class DefaultProtocolMethodProcessorImpl extends AbstractCommonProtocolMe
         if (connection.getServerReceivePubMessage() >= connection.getServerReceivePubMaximum()) {
             log.warn("Client publish exceed server receive maximum , the receive maximum is {}",
                     connection.getServerReceivePubMaximum());
-            int packetId = msg.variableHeader().packetId();
             MqttMessage quotaExceededPubAck =
-                    MqttPubAckMessageHelper.createMqtt5(packetId, Mqtt5PubReasonCode.QUOTA_EXCEEDED);
+                    MqttPubAckMessageHelper.createMqtt5(msg.variableHeader().packetId(),
+                            Mqtt5PubReasonCode.QUOTA_EXCEEDED);
             connection.sendThenClose(quotaExceededPubAck);
         } else {
             connection.incrementServerReceivePubMessage();
@@ -242,9 +247,8 @@ public class DefaultProtocolMethodProcessorImpl extends AbstractCommonProtocolMe
             }
         }
         metricsCollector.removeClient(NettyUtils.getAddress(channel));
-        connectionManager.removeConnection(connection);
-        connection.removeSubscriptions();
-        connection.close();
+        connection.close()
+                .thenAccept(__ -> connectionManager.removeConnection(connection));
     }
 
     private boolean checkAndUpdateSessionExpireIntervalIfNeed(String clientId,
@@ -279,13 +283,15 @@ public class DefaultProtocolMethodProcessorImpl extends AbstractCommonProtocolMe
             log.debug("[Connection Lost] [{}] ", clientId);
         }
         metricsCollector.removeClient(NettyUtils.getAddress(channel));
-        connectionManager.removeConnection(connection);
-        connection.removeSubscriptions();
-        subscriptionManager.removeSubscription(clientId);
         WillMessage willMessage = connection.getWillMessage();
         if (willMessage != null) {
             fireWillMessage(willMessage);
         }
+        connection.close()
+                .thenAccept(__ -> {
+                    connectionManager.removeConnection(connection);
+                    mqttSubscriptionManager.removeSubscription(clientId);
+                });
     }
 
     @Override
@@ -294,7 +300,7 @@ public class DefaultProtocolMethodProcessorImpl extends AbstractCommonProtocolMe
     }
 
     private void fireWillMessage(WillMessage willMessage) {
-        List<Pair<String, String>> subscriptions = subscriptionManager.findMatchTopic(willMessage.getTopic());
+        List<Pair<String, String>> subscriptions = mqttSubscriptionManager.findMatchTopic(willMessage.getTopic());
         MqttPublishMessage msg = createMqttWillMessage(willMessage);
         for (Pair<String, String> entry : subscriptions) {
             Connection connection = connectionManager.getConnection(entry.getLeft());
@@ -308,27 +314,16 @@ public class DefaultProtocolMethodProcessorImpl extends AbstractCommonProtocolMe
 
     @Override
     public void processSubscribe(MqttSubscribeMessage msg) {
-        String clientId = connection.getClientId();
-        String userRole = connection.getUserRole();
-        int protocolVersion = connection.getProtocolVersion();
+        final String clientId = connection.getClientId();
+        final String userRole = connection.getUserRole();
         if (log.isDebugEnabled()) {
             log.debug("[Subscribe] [{}] msg: {}", clientId, msg);
         }
-
-        if (StringUtils.isEmpty(clientId)) {
-            log.error("clientId is empty for sub [{}] close channel", msg);
-            MqttMessage subAckMessage = MqttUtils.isMqtt5(protocolVersion)
-                    ? MqttSubAckMessageHelper.createMqtt5(msg.variableHeader().messageId(),
-                    Mqtt5SubReasonCode.UNSPECIFIED_ERROR, "The client id not found.") :
-                    MqttSubAckMessageHelper.createMqtt(msg.variableHeader().messageId(), Mqtt3SubReasonCode.FAILURE);
-            connection.sendThenClose(subAckMessage);
-            return;
-        }
-
-        // Authorization the client
         if (!configuration.isMqttAuthorizationEnabled()) {
-            log.info("[Subscribe] authorization is disabled, allowing client. CId={}, userRole={}", clientId, userRole);
-            doSubscribe(msg, clientId);
+            if (log.isDebugEnabled()) {
+                log.debug("[Subscribe] authorization is disabled, allowing client. CId={}}", clientId);
+            }
+            doSubscribe(msg);
         } else {
             List<CompletableFuture<Void>> authorizationFutures = new ArrayList<>();
             AtomicBoolean authorizedFlag = new AtomicBoolean(true);
@@ -344,25 +339,31 @@ public class DefaultProtocolMethodProcessorImpl extends AbstractCommonProtocolMe
             }
             FutureUtil.waitForAll(authorizationFutures).thenAccept(__ -> {
                 if (!authorizedFlag.get()) {
-                    int messageId = msg.variableHeader().messageId();
-                    MqttMessage subscribeAckMessage = MqttUtils.isMqtt5(protocolVersion)
-                            ? MqttSubAckMessageHelper.createMqtt5(messageId, Mqtt5SubReasonCode.NOT_AUTHORIZED,
-                            String.format("The client %s not authorized.", clientId)) :
-                            MqttSubAckMessageHelper.createMqtt(messageId, Mqtt3SubReasonCode.FAILURE);
-                    connection.sendThenClose(subscribeAckMessage);
+                    doUnauthorized(msg);
                 } else {
-                    doSubscribe(msg, clientId);
+                    doSubscribe(msg);
                 }
             });
         }
     }
 
-    private void doSubscribe(MqttSubscribeMessage msg, String clientID) {
-        int messageID = msg.variableHeader().messageId();
-        List<MqttTopicSubscription> subTopics = topicSubscriptions(msg);
-        subscriptionManager.addSubscriptions(connection.getClientId(), subTopics);
+    private CompletableFuture<Void> doUnauthorized(MqttSubscribeMessage msg) {
+        final String clientId = connection.getClientId();
+        final int protocolVersion = connection.getProtocolVersion();
+        final int messageId = msg.variableHeader().messageId();
+        MqttMessage subscribeAckMessage = MqttUtils.isMqtt5(protocolVersion)
+                ? MqttSubAckMessageHelper.createMqtt5(messageId, Mqtt5SubReasonCode.NOT_AUTHORIZED,
+                String.format("The client %s not authorized.", clientId)) :
+                MqttSubAckMessageHelper.createMqtt(messageId, Mqtt3SubReasonCode.FAILURE);
+        connection.sendThenClose(subscribeAckMessage);
+        return CompletableFuture.completedFuture(null);
+    }
+
+    private CompletableFuture<Void> doSubscribe(MqttSubscribeMessage msg) {
+        final int messageID = msg.variableHeader().messageId();
+        final List<MqttTopicSubscription> subTopics = topicSubscriptions(msg);
+        mqttSubscriptionManager.addSubscriptions(connection.getClientId(), subTopics);
         List<CompletableFuture<Void>> futureList = new ArrayList<>(subTopics.size());
-        Map<Topic, Pair<Subscription, Consumer>> topicSubscriptions = new ConcurrentHashMap<>();
         for (MqttTopicSubscription subTopic : subTopics) {
             metricsCollector.addSub(subTopic.topicName());
             CompletableFuture<List<String>> topicListFuture = PulsarTopicUtils.asyncGetTopicListFromTopicSubscription(
@@ -372,17 +373,17 @@ public class DefaultProtocolMethodProcessorImpl extends AbstractCommonProtocolMe
                 List<CompletableFuture<Void>> futures = new ArrayList<>();
                 for (String topic : topics) {
                     CompletableFuture<Subscription> subFuture = PulsarTopicUtils
-                            .getOrCreateSubscription(pulsarService, topic, clientID,
+                            .getOrCreateSubscription(pulsarService, topic, connection.getClientId(),
                                     configuration.getDefaultTenant(), configuration.getDefaultNamespace(),
                                     configuration.getDefaultTopicDomain());
                     CompletableFuture<Void> result = subFuture.thenAccept(sub -> {
                         try {
                             MQTTConsumer consumer = new MQTTConsumer(sub, subTopic.topicName(), topic,
-                                    clientID, serverCnx, subTopic.qualityOfService(), packetIdGenerator,
+                                    connection.getClientId(), serverCnx, subTopic.qualityOfService(), packetIdGenerator,
                                     outstandingPacketContainer, metricsCollector, connection.getClientReceiveMaximum());
                             sub.addConsumer(consumer);
                             consumer.addAllPermits();
-                            topicSubscriptions.putIfAbsent(sub.getTopic(), Pair.of(sub, consumer));
+                            connection.getTopicSubscriptionManager().putIfAbsent(sub.getTopic(), sub, consumer);
                         } catch (Exception e) {
                             throw new MQTTServerException(e);
                         }
@@ -393,23 +394,18 @@ public class DefaultProtocolMethodProcessorImpl extends AbstractCommonProtocolMe
             });
             futureList.add(completableFuture);
         }
-        int protocolVersion = connection.getProtocolVersion();
-        FutureUtil.waitForAll(futureList).thenAccept(v -> {
+        return FutureUtil.waitForAll(futureList).thenAccept(v -> {
             MqttMessage ackMessage =
                     // Support MQTT 5
-                    MqttUtils.isMqtt5(protocolVersion) ? MqttSubAckMessageHelper.createMqtt5(messageID, subTopics) :
-                            MqttSubAckMessageHelper.createMqtt(messageID, subTopics);
+                    MqttUtils.isMqtt5(connection.getProtocolVersion())
+                            ? MqttSubAckMessageHelper.createMqtt5(messageID, subTopics)
+                            : MqttSubAckMessageHelper.createMqtt(messageID, subTopics);
             if (log.isDebugEnabled()) {
-                log.debug("Sending SUB-ACK message {} to {}", ackMessage, clientID);
+                log.debug("Sending SUB-ACK message {} to {}", ackMessage, connection.getClientId());
             }
-            channel.writeAndFlush(ackMessage);
-            Map<Topic, Pair<Subscription, Consumer>> existedSubscriptions = NettyUtils.getTopicSubscriptions(channel);
-            if (existedSubscriptions != null) {
-                topicSubscriptions.putAll(existedSubscriptions);
-            }
-            NettyUtils.setTopicSubscriptions(channel, topicSubscriptions);
+            connection.send(ackMessage);
         }).exceptionally(e -> {
-            log.error("[{}] Failed to process MQTT subscribe.", clientID, e);
+            log.error("[{}] Failed to process MQTT subscribe.", connection.getClientId(), e);
             MopExceptionHelper.handle(MqttMessageType.SUBSCRIBE, messageID, channel, e);
             return null;
         });
@@ -417,70 +413,49 @@ public class DefaultProtocolMethodProcessorImpl extends AbstractCommonProtocolMe
 
     @Override
     public void processUnSubscribe(MqttUnsubscribeMessage msg) {
-        String clientID = connection.getClientId();
+        final String clientId = connection.getClientId();
         if (log.isDebugEnabled()) {
-            log.debug("[Unsubscribe] [{}] msg: {}", clientID, msg);
+            log.debug("[Unsubscribe] [{}] msg: {}", clientId, msg);
         }
-        List<String> topicFilters = msg.payload().topics();
-        final MqttQoS qos = msg.fixedHeader().qosLevel();
-        List<CompletableFuture<Void>> futureList = new ArrayList<>(topicFilters.size());
+        final List<String> topicFilters = msg.payload().topics();
+        final List<CompletableFuture<Void>> futureList = new ArrayList<>(topicFilters.size());
         for (String topicFilter : topicFilters) {
             metricsCollector.removeSub(topicFilter);
             CompletableFuture<List<String>> topicListFuture = PulsarTopicUtils.asyncGetTopicListFromTopicSubscription(
                     topicFilter, configuration.getDefaultTenant(), configuration.getDefaultNamespace(), pulsarService,
                     configuration.getDefaultTopicDomain());
             CompletableFuture<Void> future = topicListFuture.thenCompose(topics -> {
-                List<CompletableFuture<Void>> futures = new ArrayList<>();
-                for (String topic : topics) {
-                    PulsarTopicUtils.getTopicReference(pulsarService, topic, configuration.getDefaultTenant(),
-                            configuration.getDefaultNamespace(), false,
-                            configuration.getDefaultTopicDomain(), false).thenAccept(topicOp -> {
-                        if (!topicOp.isPresent()) {
-                            throw new MQTTTopicNotExistedException(
-                                    String.format("Can not found topic %s when %s unSubscribe.", topic,
-                                            clientID));
-                        }
-                        Subscription subscription = topicOp.get().getSubscription(clientID);
-                        if (subscription == null) {
-                            throw new MQTTNoSubscriptionExistedException(
-                                    String.format(
-                                            "Can not found subscription %s when %s unSubscribe. the "
-                                                    + "topic is "
-                                                    + "%s",
-                                            clientID, clientID, topic));
-                        }
-                        try {
-                            MQTTConsumer consumer = new MQTTConsumer(subscription, topicFilter,
-                                    topic, clientID, serverCnx, qos, packetIdGenerator,
-                                    outstandingPacketContainer, metricsCollector, connection.getClientReceiveMaximum());
-                            topicOp.get().getSubscription(clientID).removeConsumer(consumer);
-                            futures.add(topicOp.get().unsubscribe(clientID));
-                        } catch (Exception e) {
-                            throw new MQTTServerException(e);
-                        }
-                    }).exceptionally(ex -> {
-                        futures.add(FutureUtil.failedFuture(ex));
-                        return null;
-                    });
-                }
+                List<CompletableFuture<Void>> futures = topics.stream()
+                        .map(topic -> PulsarTopicUtils.getTopicReference(pulsarService,
+                                topic, configuration.getDefaultTenant(), configuration.getDefaultNamespace(), false,
+                                configuration.getDefaultTopicDomain(), false))
+                        .map(topicFuture -> topicFuture.thenCompose(topicOp -> {
+                            if (!topicOp.isPresent()) {
+                                throw new MQTTTopicNotExistedException(
+                                        String.format("Can not found topic when %s unSubscribe.", clientId));
+                            }
+                            return connection.getTopicSubscriptionManager()
+                                    .unsubscribe(topicOp.get(), false);
+                        }))
+                        .collect(Collectors.toList());
                 return FutureUtil.waitForAll(futures);
             });
             futureList.add(future);
         }
-        int messageID = msg.variableHeader().messageId();
+        int messageId = msg.variableHeader().messageId();
         int protocolVersion = connection.getProtocolVersion();
         FutureUtil.waitForAll(futureList).thenAccept(__ -> {
             // ack the client
             MqttMessage ackMessage = MqttUtils.isMqtt5(protocolVersion) ?  // Support Mqtt version 5.0 reason code.
-                    MqttUnsubAckMessageHelper.createMqtt5(messageID, Mqtt5UnsubReasonCode.SUCCESS) :
-                    MqttUnsubAckMessageHelper.createMqtt(messageID);
+                    MqttUnsubAckMessageHelper.createMqtt5(messageId, Mqtt5UnsubReasonCode.SUCCESS) :
+                    MqttUnsubAckMessageHelper.createMqtt(messageId);
             if (log.isDebugEnabled()) {
-                log.debug("Sending UNSUBACK message {} to {}", ackMessage, clientID);
+                log.debug("Sending UNSUBACK message {} to {}", ackMessage, clientId);
             }
-            channel.writeAndFlush(ackMessage);
+            connection.send(ackMessage);
         }).exceptionally(ex -> {
-            log.error("[{}] Failed to process the UNSUB {}", clientID, msg);
-            MopExceptionHelper.handle(MqttMessageType.UNSUBSCRIBE, messageID, channel, ex);
+            log.error("[{}] Failed to process the UNSUB {}", clientId, msg);
+            MopExceptionHelper.handle(MqttMessageType.UNSUBSCRIBE, messageId, channel, ex);
             return null;
         });
     }
